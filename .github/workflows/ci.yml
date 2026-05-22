@@ -52,8 +52,10 @@ jobs:
             | gpg --batch --yes --dearmor \
             | sudo tee /usr/share/keyrings/microsoft-prod.gpg >/dev/null
           UBUNTU_REL="$(. /etc/os-release && echo $VERSION_ID)"
+          # MS's prod.list already carries `signed-by=...microsoft-prod.gpg`
+          # baked in (and points at the path we just wrote above), so use it
+          # as-is — adding another `[signed-by=...]` bracket malforms the line.
           curl -sSL "https://packages.microsoft.com/config/ubuntu/${UBUNTU_REL}/prod.list" \
-            | sed 's|^deb |deb [signed-by=/usr/share/keyrings/microsoft-prod.gpg] |' \
             | sudo tee /etc/apt/sources.list.d/mssql-release.list >/dev/null
           sudo apt-get update -qq
           sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18
