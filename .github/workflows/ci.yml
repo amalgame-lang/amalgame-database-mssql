@@ -45,8 +45,12 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y libgc-dev libcurl4-openssl-dev unixodbc-dev curl gnupg
-          # Microsoft repo for msodbcsql18.
-          curl -sSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+          # Microsoft repo for msodbcsql18. Dearmor without sudo
+          # (sudo+gpg trips /dev/tty even with no passphrase), then
+          # move into the keyring path via tee.
+          curl -sSL https://packages.microsoft.com/keys/microsoft.asc \
+            | gpg --batch --yes --dearmor \
+            | sudo tee /usr/share/keyrings/microsoft-prod.gpg >/dev/null
           UBUNTU_REL="$(. /etc/os-release && echo $VERSION_ID)"
           curl -sSL "https://packages.microsoft.com/config/ubuntu/${UBUNTU_REL}/prod.list" \
             | sed 's|^deb |deb [signed-by=/usr/share/keyrings/microsoft-prod.gpg] |' \
