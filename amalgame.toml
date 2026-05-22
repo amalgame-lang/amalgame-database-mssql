@@ -1,0 +1,94 @@
+# Package manifest — amalgame-database-mssql
+#
+# Microsoft SQL Server binding for Amalgame — dynamic-linked to
+# `libodbc` (the unixODBC driver manager) plus the
+# vendor-distributed *ODBC Driver for SQL Server* (Microsoft, free
+# redistributable). Nothing is vendored: this follows the same
+# dynamic-link manifest pattern as `amalgame-database-postgresql`
+# and `amalgame-database-mysql`.
+#
+# Why ODBC instead of FreeTDS or Tiberius:
+#   - Microsoft's own ODBC driver is the only client that tracks
+#     newer SQL Server features (AAD auth, ColumnEncryption,
+#     TDS 8 with strict TLS) — FreeTDS is feature-frozen below
+#     TDS 7.4.
+#   - ODBC is uniformly available on Linux / macOS / Windows.
+#     `libodbc` (unixODBC) ships in every distro; macOS has it
+#     via Homebrew (`brew install unixodbc`); Windows has ODBC
+#     built into the OS.
+#   - Same client API works against MS SQL Server, Azure SQL
+#     Database, and Azure SQL Managed Instance.
+#
+# Prereqs (compile time):
+#   Debian / Ubuntu : apt install unixodbc-dev
+#                     + add the MS apt repo and apt install msodbcsql18
+#                       (see https://learn.microsoft.com/sql/connect/odbc/linux-mac/installing-the-microsoft-odbc-driver-for-sql-server)
+#   Fedora / RHEL   : dnf install unixODBC-devel msodbcsql18
+#   Arch            : pacman -S unixodbc + AUR msodbcsql
+#   macOS (Homebrew): brew install unixodbc
+#                     brew tap microsoft/mssql-release && brew install msodbcsql18
+#   Windows         : ODBC ships with the OS; install the MS
+#                     SQL Server ODBC driver from microsoft.com
+#
+# Prereqs (runtime, the deployed user binary): the same `libodbc`
+# shared library plus the MS ODBC driver must be present on the
+# user's machine.
+#
+# Surface (v1):
+#   Open(connStr) / Close / IsOpen / LastError      lifecycle + diag
+#   Exec(sql)                                       DDL / INSERT / UPDATE / DELETE
+#   QueryAll(sql) → List<List<string>>              SELECT all rows × cols
+#   Changes                                         rows affected by last Exec
+#   ServerVersion                                   SQL Server version string
+#
+# Out of scope (v2):
+#   - Parameter binding (`?` placeholders) via SQLBindParameter
+#   - Prepared statement reuse (SQLPrepare + repeated SQLExecute)
+#   - Typed column accessors (AsInt / AsBytes / AsDateTime)
+#   - Bulk insert (SQLBulkOperations / bcp_*)
+#   - Async query mode (SQL_ATTR_ASYNC_ENABLE)
+#   - Azure AD / managed identity helpers (works today via the
+#     connection string `Authentication=ActiveDirectory…` keyword)
+#   - TVPs / table-valued parameters
+#
+# Installation:
+#
+#   amc package add mssql                                           # via index
+#   amc package add github.com/amalgame-lang/amalgame-database-mssql@v0.1.0
+
+[package]
+name              = "amalgame-database-mssql"
+version           = "0.1.0"
+license           = "Apache-2.0"
+description       = "Microsoft SQL Server binding for Amalgame — dynamic-linked to unixODBC + MS ODBC Driver, no vendored lib."
+authors           = ["Bastien Mouget"]
+required-amalgame = ">=0.8.19"
+schema-version    = 1
+
+[stdlib]
+class     = "MSSQL"
+header    = "runtime/Amalgame_Database_MSSQL.h"
+namespace = "Amalgame.Database.MSSQL"
+
+# No vendored .c sources — unixODBC + the MS ODBC Driver are
+# provided by the system. The wrapper header uses __has_include()
+# to find <sql.h>/<sqlext.h> across the common system layouts.
+
+# Link against the system unixODBC driver manager. amc forwards
+# this as `-lodbc` to the user binary's gcc step. On Windows the
+# system ODBC manager is found via `-lodbc32`; users on Windows
+# should set AMALGAME_EXTRA_LDFLAGS=-lodbc32 if the bare -lodbc
+# doesn't resolve.
+libs       = ["odbc"]
+
+[stdlib.functions]
+Open           = { returns = "AmalgameMSSQL*" }
+Close          = { returns = "void" }
+IsOpen         = { returns = "code_bool" }
+LastError      = { returns = "code_string" }
+Exec           = { returns = "code_bool" }
+QueryAll       = { returns = "AmalgameList*" }
+Changes        = { returns = "i64" }
+ServerVersion  = { returns = "code_string" }
+
+[dependencies]

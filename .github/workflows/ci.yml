@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test against amc ${{ matrix.amc-tag }}
+    runs-on: ubuntu-latest
+
+    # GitHub Actions native service container: a fresh SQL Server
+    # 2022 instance is spun up alongside the job. The MS image
+    # doesn't expose a built-in healthcheck binary, so we let it
+    # boot and probe TCP from the runner step.
+    services:
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: Y
+          MSSQL_SA_PASSWORD: 'YourStrong!Passw0rd'
+        ports: ['1433:1433']
+
+    env:
+      MSSQL_HOST: 127.0.0.1
+      MSSQL_PORT: 1433
+      MSSQL_CONNSTR: 'Driver={ODBC Driver 18 for SQL Server};Server=127.0.0.1,1433;Database=master;UID=sa;PWD=YourStrong!Passw0rd;TrustServerCertificate=yes'
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # v0.8.19+ is required (cgen + LSP fixes for cross-package
+        # opaque collection indexing). Append a tag whenever amc
+        # cuts a meaningfully relevant release.
+        amc-tag: [v0.8.20]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps (libgc + libcurl + unixodbc + msodbcsql18)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libgc-dev libcurl4-openssl-dev unixodbc-dev curl gnupg
+          # Microsoft repo for msodbcsql18.
+          curl -sSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+          UBUNTU_REL="$(. /etc/os-release && echo $VERSION_ID)"
+          curl -sSL "https://packages.microsoft.com/config/ubuntu/${UBUNTU_REL}/prod.list" \
+            | sed 's|^deb |deb [signed-by=/usr/share/keyrings/microsoft-prod.gpg] |' \
+            | sudo tee /etc/apt/sources.list.d/mssql-release.list >/dev/null
+          sudo apt-get update -qq
+          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18
+
+      - name: Download amc ${{ matrix.amc-tag }}
+        run: |
+          set -e
+          TAG="${{ matrix.amc-tag }}"
+          VERSION="${TAG#v}"
+          curl -sSL -o amc.tar.gz \
+            "https://github.com/amalgame-lang/Amalgame/releases/download/${TAG}/amc-${VERSION}-linux-x86_64.tar.gz"
+          mkdir -p $RUNNER_TEMP/amc-install
+          tar -xzf amc.tar.gz -C $RUNNER_TEMP/amc-install --strip-components=1
+          echo "AMC=$RUNNER_TEMP/amc-install/bin/amc" >> $GITHUB_ENV
+          echo "AMC_RUNTIME=$RUNNER_TEMP/amc-install/share/amalgame/runtime" >> $GITHUB_ENV
+
+      - name: Probe unixODBC + wait for SQL Server
+        run: |
+          echo "── unixODBC header probe ──"
+          echo "#include <sql.h>" | gcc -E -xc - >/dev/null && echo "  sql.h: OK"
+          echo "── msodbcsql18 installed drivers ──"
+          odbcinst -q -d
+          echo "── mssql reachability (poll up to 60s) ──"
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/1433) 2>/dev/null; then
+              echo "  tcp 1433: reachable after ${i}×2s"; break
+            fi
+            sleep 2
+          done
+
+      - name: Run end-to-end tests
+        run: |
+          chmod +x ./tests/run_tests.sh
+          ./tests/run_tests.sh "$AMC"

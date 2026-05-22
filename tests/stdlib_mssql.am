@@ -1,0 +1,132 @@
+// Stdlib test: Amalgame.Database.MSSQL — unixODBC + MS ODBC Driver binding.
+// Self-contained schema namespace (`amctest_*` prefix) so a
+// shared dev server isn't polluted. Tests CREATE / INSERT /
+// SELECT / DROP.
+//
+// Connection string comes from the MSSQL_CONNSTR environment
+// variable so the .am file itself doesn't carry credentials.
+// Typical value (docker-compose mssql:2022):
+//   "Driver={ODBC Driver 18 for SQL Server};Server=127.0.0.1,1433;
+//    Database=master;UID=sa;PWD=YourStrong!Passw0rd;TrustServerCertificate=yes"
+// The test runner exports this before invoking us.
+
+namespace Tests
+
+import Amalgame.Database.MSSQL
+
+public class Program {
+    public static void Main(string[] args) {
+
+        let connStr: string = Env.Get("MSSQL_CONNSTR")
+        if (String_Length(connStr) == 0) {
+            Console.WriteLine("[FAIL] MSSQL_CONNSTR not set")
+            return
+        }
+
+        let db = MSSQL.Open(connStr)
+        if (MSSQL.IsOpen(db)) {
+            Console.WriteLine("[PASS] open")
+        } else {
+            Console.WriteLine("[FAIL] open: " + MSSQL.LastError(db))
+            return
+        }
+
+        // ── ServerVersion ────────────────────────────────────
+        let ver: string = MSSQL.ServerVersion(db)
+        if (String_Length(ver) > 0) {
+            Console.WriteLine("[PASS] ServerVersion: " + ver)
+        } else {
+            Console.WriteLine("[FAIL] ServerVersion empty")
+        }
+
+        // ── DDL: clean slate + table ──────────────────────────
+        // IF EXISTS on DROP TABLE works on SQL Server 2016+.
+        MSSQL.Exec(db, "DROP TABLE IF EXISTS amctest_notes")
+        let createOk: bool = MSSQL.Exec(db,
+            "CREATE TABLE amctest_notes (id INT IDENTITY(1,1) PRIMARY KEY, body NVARCHAR(200))")
+        if (createOk) {
+            Console.WriteLine("[PASS] CREATE TABLE")
+        } else {
+            Console.WriteLine("[FAIL] CREATE: " + MSSQL.LastError(db))
+        }
+
+        // ── INSERT (3 rows) ───────────────────────────────────
+        MSSQL.Exec(db, "INSERT INTO amctest_notes (body) VALUES ('alpha')")
+        MSSQL.Exec(db, "INSERT INTO amctest_notes (body) VALUES ('beta')")
+        MSSQL.Exec(db, "INSERT INTO amctest_notes (body) VALUES ('gamma')")
+        // Changes() reports the rows affected by the LAST exec.
+        let lastChg: int = MSSQL.Changes(db)
+        if (lastChg == 1) {
+            Console.WriteLine("[PASS] INSERT Changes==1")
+        } else {
+            Console.WriteLine("[FAIL] INSERT Changes=" + String_FromInt(lastChg))
+        }
+
+        // ── SELECT — 3 rows × 2 cols ─────────────────────────
+        let rows = MSSQL.QueryAll(db,
+            "SELECT id, body FROM amctest_notes ORDER BY id")
+        if (rows.Count() == 3) {
+            Console.WriteLine("[PASS] SELECT 3 rows")
+        } else {
+            Console.WriteLine("[FAIL] SELECT got " + String_FromInt(rows.Count())
+                + " rows")
+        }
+
+        // ── Verify cell content ──────────────────────────────
+        let row0 = rows.Get(0)
+        let row1 = rows.Get(1)
+        let row2 = rows.Get(2)
+        let body0: string = row0.Get(1)
+        let body1: string = row1.Get(1)
+        let body2: string = row2.Get(1)
+        let okBodies: bool = body0 == "alpha"
+        let okBodies2: bool = body1 == "beta"
+        let okBodies3: bool = body2 == "gamma"
+        if (okBodies && okBodies2 && okBodies3) {
+            Console.WriteLine("[PASS] SELECT cell content")
+        } else {
+            Console.WriteLine("[FAIL] cells: '" + body0 + "' / '"
+                + body1 + "' / '" + body2 + "'")
+        }
+
+        // ── Verify IDENTITY id starts at 1 ───────────────────
+        let id0: string = row0.Get(0)
+        if (id0 == "1") {
+            Console.WriteLine("[PASS] IDENTITY id starts at 1")
+        } else {
+            Console.WriteLine("[FAIL] id0 = '" + id0 + "'")
+        }
+
+        // ── UPDATE — Changes returns affected count ──────────
+        MSSQL.Exec(db,
+            "UPDATE amctest_notes SET body = 'updated' WHERE body = 'alpha' OR body = 'beta'")
+        let chgUpd: int = MSSQL.Changes(db)
+        if (chgUpd == 2) {
+            Console.WriteLine("[PASS] UPDATE Changes==2")
+        } else {
+            Console.WriteLine("[FAIL] UPDATE Changes=" + String_FromInt(chgUpd))
+        }
+
+        // ── Bad SQL → LastError populated ────────────────────
+        let badOk: bool = MSSQL.Exec(db, "INVALID SQL HERE")
+        if (badOk) {
+            Console.WriteLine("[FAIL] invalid sql returned OK")
+        } else {
+            let err: string = MSSQL.LastError(db)
+            if (String_Length(err) > 0) {
+                Console.WriteLine("[PASS] bad SQL reports error")
+            } else {
+                Console.WriteLine("[FAIL] bad SQL: no error string")
+            }
+        }
+
+        // ── Cleanup + close ──────────────────────────────────
+        MSSQL.Exec(db, "DROP TABLE amctest_notes")
+        MSSQL.Close(db)
+        if (!MSSQL.IsOpen(db)) {
+            Console.WriteLine("[PASS] Close drops connection")
+        } else {
+            Console.WriteLine("[FAIL] still open after Close")
+        }
+    }
+}
