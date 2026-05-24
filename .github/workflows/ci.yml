@@ -33,18 +33,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # v0.8.19+ is required (cgen + LSP fixes for cross-package
-        # opaque collection indexing). Append a tag whenever amc
-        # cuts a meaningfully relevant release.
-        amc-tag: [v0.8.20]
+        # v0.2.0+ requires amc 0.8.40+ for `returns_generic` on
+        # QueryAll. Pinned to the latest amc release.
+        amc-tag: [v0.8.47]
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system deps (libgc + libcurl + unixodbc + msodbcsql18)
+      - name: Install system deps (libgc + unixodbc + msodbcsql18)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y libgc-dev libcurl4-openssl-dev unixodbc-dev curl gnupg
+          sudo apt-get install -y libgc-dev unixodbc-dev curl gnupg
           # Microsoft repo for msodbcsql18. Dearmor without sudo
           # (sudo+gpg trips /dev/tty even with no passphrase), then
           # move into the keyring path via tee.

@@ -147,7 +147,7 @@ run_test() {
     gcc -O2 -w \
         -I"$AMC_RUNTIME" -I"$PKG_RUNTIME" \
         "$out_base.c" \
-        -lgc -lm -lcurl -ldl -lpthread -lodbc \
+        -lgc -lm -ldl -lpthread -lodbc \
         -o "$out_base" 2>"$BUILD_DIR/link.log"
     if [ ! -x "$out_base" ]; then
         echo -e "${RED}FAIL${NC} (gcc link)"
