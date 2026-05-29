@@ -372,6 +372,225 @@ static inline i64 Amalgame_Database_MSSQL_Changes(AmalgameMSSQL* db) {
     return db ? db->last_changes : 0;
 }
 
+/* ────────────────────────────────────────────────────────────────
+ * v0.3 surface — parameter binding + transactions.
+ *
+ * Placeholders are positional `?` (1-indexed in SQL, 0-indexed in
+ * the AM list — ODBC's native convention, shared with SQLite,
+ * DuckDB and MySQL; PostgreSQL uses $1/$2). Binding goes through
+ * SQLPrepare + SQLBindParameter + SQLExecute. Every value is bound
+ * as SQL_C_CHAR / SQL_VARCHAR with the runtime byte length; SQL
+ * Server applies its standard type coercion at server side.
+ *
+ * NULL list entries become SQL NULL via SQL_NULL_DATA in the
+ * StrLen_or_IndPtr.
+ *
+ * Arity mismatches surface as "param count mismatch: got X, sql
+ * expects Y" via SQLNumParams — same shape as the SQLite / DuckDB
+ * / MySQL siblings.
+ *
+ * Transactions use T-SQL `BEGIN TRANSACTION` / `COMMIT` /
+ * `ROLLBACK` through the existing Exec path. SQL Server's explicit
+ * transactions work alongside ODBC autocommit so we don't need to
+ * touch SQL_ATTR_AUTOCOMMIT — `BEGIN TRANSACTION` opens a user
+ * transaction that survives subsequent statements until an
+ * explicit COMMIT/ROLLBACK.
+ * ──────────────────────────────────────────────────────────────── */
+
+/* Shared bind helper: allocates the statement, prepares, validates
+ * arity, binds every param as SQL_C_CHAR. Returns the statement
+ * handle on success (caller frees), NULL on failure (with
+ * db->last_error set + helper-allocated arrays freed). The
+ * SQLLEN length array is also returned so the caller can free it
+ * after SQLExecute (it's referenced by SQLBindParameter until
+ * then). The caller-allocated lens buffer survives the call. */
+static inline SQLHSTMT _amms_prepare_bound(
+    AmalgameMSSQL* db, code_string sql, AmalgameList* params,
+    SQLLEN** outLens)
+{
+    SQLHSTMT stmt = NULL;
+    SQLRETURN rc = SQLAllocHandle(SQL_HANDLE_STMT, db->dbc, &stmt);
+    if (!SQL_SUCCEEDED(rc)) {
+        db->last_error = _amms_err_from_handle(SQL_HANDLE_DBC, db->dbc);
+        return NULL;
+    }
+    rc = SQLPrepare(stmt, (SQLCHAR*) sql, SQL_NTS);
+    if (!SQL_SUCCEEDED(rc)) {
+        db->last_error = _amms_err_from_handle(SQL_HANDLE_STMT, stmt);
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+        return NULL;
+    }
+    int n = params ? (int) AmalgameList_size(params) : 0;
+    SQLSMALLINT pcount = 0;
+    if (!SQL_SUCCEEDED(SQLNumParams(stmt, &pcount))) {
+        db->last_error = _amms_err_from_handle(SQL_HANDLE_STMT, stmt);
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+        return NULL;
+    }
+    if ((SQLSMALLINT) n != pcount) {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+            "param count mismatch: got %d, sql expects %d", n, (int) pcount);
+        db->last_error = _amms_err_dup(buf);
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+        return NULL;
+    }
+    SQLLEN* lens = (n > 0) ? (SQLLEN*) calloc((size_t)n, sizeof(SQLLEN)) : NULL;
+    for (int i = 0; i < n; i++) {
+        code_string v = (code_string) AmalgameList_get(params, i);
+        if (v) {
+            SQLULEN blen = (SQLULEN) strlen(v);
+            lens[i] = SQL_NTS;   /* SQLBindParameter reads to NUL */
+            rc = SQLBindParameter(stmt, (SQLUSMALLINT)(i + 1),
+                                  SQL_PARAM_INPUT,
+                                  SQL_C_CHAR, SQL_VARCHAR,
+                                  blen, 0,
+                                  (SQLPOINTER) v, (SQLLEN) (blen + 1),
+                                  &lens[i]);
+        } else {
+            lens[i] = SQL_NULL_DATA;
+            rc = SQLBindParameter(stmt, (SQLUSMALLINT)(i + 1),
+                                  SQL_PARAM_INPUT,
+                                  SQL_C_CHAR, SQL_VARCHAR,
+                                  1, 0, NULL, 0, &lens[i]);
+        }
+        if (!SQL_SUCCEEDED(rc)) {
+            db->last_error = _amms_err_from_handle(SQL_HANDLE_STMT, stmt);
+            free(lens);
+            SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+            return NULL;
+        }
+    }
+    *outLens = lens;
+    return stmt;
+}
+
+static inline code_bool Amalgame_Database_MSSQL_ExecBind(
+        AmalgameMSSQL* db, code_string sql, AmalgameList* params)
+{
+    if (!db || !db->dbc) {
+        if (db) db->last_error = _amms_err_dup("connection not open");
+        return 0;
+    }
+    if (!sql) { db->last_error = _amms_err_dup("null sql"); return 0; }
+    SQLLEN* lens = NULL;
+    SQLHSTMT stmt = _amms_prepare_bound(db, sql, params, &lens);
+    if (!stmt) return 0;
+    SQLRETURN rc = SQLExecute(stmt);
+    if (!SQL_SUCCEEDED(rc) && rc != SQL_NO_DATA) {
+        db->last_error = _amms_err_from_handle(SQL_HANDLE_STMT, stmt);
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+        free(lens);
+        return 0;
+    }
+    SQLLEN n = 0;
+    if (SQL_SUCCEEDED(SQLRowCount(stmt, &n))) {
+        db->last_changes = (i64) (n >= 0 ? n : 0);
+    } else {
+        db->last_changes = 0;
+    }
+    SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+    free(lens);
+    db->last_error = _amms_err_dup("");
+    return 1;
+}
+
+static inline AmalgameList* Amalgame_Database_MSSQL_QueryBindAll(
+        AmalgameMSSQL* db, code_string sql, AmalgameList* params)
+{
+    AmalgameList* rows = AmalgameList_new();
+    if (!db || !db->dbc) {
+        if (db) db->last_error = _amms_err_dup("connection not open");
+        return rows;
+    }
+    if (!sql) { db->last_error = _amms_err_dup("null sql"); return rows; }
+    SQLLEN* lens = NULL;
+    SQLHSTMT stmt = _amms_prepare_bound(db, sql, params, &lens);
+    if (!stmt) return rows;
+    SQLRETURN rc = SQLExecute(stmt);
+    if (!SQL_SUCCEEDED(rc) && rc != SQL_NO_DATA) {
+        db->last_error = _amms_err_from_handle(SQL_HANDLE_STMT, stmt);
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+        free(lens);
+        return rows;
+    }
+    SQLSMALLINT ncols = 0;
+    if (!SQL_SUCCEEDED(SQLNumResultCols(stmt, &ncols))) {
+        db->last_error = _amms_err_from_handle(SQL_HANDLE_STMT, stmt);
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+        free(lens);
+        return rows;
+    }
+    SQLLEN nrows = 0;
+    while ((rc = SQLFetch(stmt)) == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) {
+        AmalgameList* one = AmalgameList_new();
+        for (SQLSMALLINT j = 1; j <= ncols; j++) {
+            char probe[256];
+            SQLLEN ind = 0;
+            SQLRETURN gd = SQLGetData(stmt, j, SQL_C_CHAR,
+                                       probe, (SQLLEN) sizeof(probe), &ind);
+            if (gd == SQL_NULL_DATA || ind == SQL_NULL_DATA) {
+                char* dup = (char*) code_alloc(1);
+                dup[0] = '\0';
+                AmalgameList_add(one, (void*) dup);
+                continue;
+            }
+            if (!SQL_SUCCEEDED(gd)) {
+                char* dup = (char*) code_alloc(1);
+                dup[0] = '\0';
+                AmalgameList_add(one, (void*) dup);
+                continue;
+            }
+            if (gd == SQL_SUCCESS_WITH_INFO && ind > (SQLLEN) (sizeof(probe) - 1)) {
+                size_t total = (size_t) ind;
+                char* full = (char*) code_alloc(total + 1);
+                size_t got = sizeof(probe) - 1;
+                memcpy(full, probe, got);
+                SQLLEN ind2 = 0;
+                SQLRETURN gd2 = SQLGetData(stmt, j, SQL_C_CHAR,
+                                            full + got,
+                                            (SQLLEN) (total - got + 1),
+                                            &ind2);
+                if (!SQL_SUCCEEDED(gd2)) {
+                    full[got] = '\0';
+                }
+                AmalgameList_add(one, (void*) full);
+            } else {
+                size_t nn = (ind > 0) ? (size_t) ind : strlen(probe);
+                char* dup = (char*) code_alloc(nn + 1);
+                if (nn > 0) memcpy(dup, probe, nn);
+                dup[nn] = '\0';
+                AmalgameList_add(one, (void*) dup);
+            }
+        }
+        AmalgameList_add(rows, (void*) one);
+        nrows++;
+    }
+    if (rc != SQL_NO_DATA && !SQL_SUCCEEDED(rc)) {
+        db->last_error = _amms_err_from_handle(SQL_HANDLE_STMT, stmt);
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+        free(lens);
+        return rows;
+    }
+    db->last_changes = (i64) nrows;
+    SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+    free(lens);
+    db->last_error = _amms_err_dup("");
+    return rows;
+}
+
+static inline code_bool Amalgame_Database_MSSQL_Begin(AmalgameMSSQL* db) {
+    return Amalgame_Database_MSSQL_Exec(db, "BEGIN TRANSACTION");
+}
+
+static inline code_bool Amalgame_Database_MSSQL_Commit(AmalgameMSSQL* db) {
+    return Amalgame_Database_MSSQL_Exec(db, "COMMIT");
+}
+
+static inline code_bool Amalgame_Database_MSSQL_Rollback(AmalgameMSSQL* db) {
+    return Amalgame_Database_MSSQL_Exec(db, "ROLLBACK");
+}
+
 /* SQL Server version string via SQLGetInfo(SQL_DBMS_VER) — e.g.
  * "16.00.4115" for SQL Server 2022, "15.00.4153" for 2019. Empty
  * when the connection is closed. */

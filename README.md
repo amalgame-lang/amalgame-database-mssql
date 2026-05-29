@@ -106,6 +106,27 @@ MSSQL.Close(db)
 | `MSSQL.QueryAll(db, sql)` | `List<List<string>>` | SELECT, text mode (SQL_C_CHAR) |
 | `MSSQL.Changes(db)` | `int` | Rows affected by last Exec / row count of last QueryAll |
 | `MSSQL.ServerVersion(db)` | `string` | "16.00.4115" (2022), "15.00.4153" (2019), … |
+| `MSSQL.ExecBind(db, sql, params)` | `bool` | `?` placeholders via `SQLBindParameter` (v0.3+) |
+| `MSSQL.QueryBindAll(db, sql, params)` | `List<List<string>>` | Parameterised SELECT (v0.3+) |
+| `MSSQL.Begin(db)` | `bool` | Start transaction (v0.3+) |
+| `MSSQL.Commit(db)` | `bool` | Commit transaction (v0.3+) |
+| `MSSQL.Rollback(db)` | `bool` | Roll back transaction (v0.3+) |
+
+### Parameter binding (v0.3+)
+
+```amalgame
+let params: List<string> = new List<string>()
+params.Add("Alice")
+params.Add("30")
+MSSQL.ExecBind(db, "INSERT INTO users (name, age) VALUES (?, ?)", params)
+```
+
+Positional `?` placeholders (ODBC's native convention, also shared
+with SQLite / DuckDB / MySQL; PostgreSQL uses `$1`/`$2`). Binding
+goes through `SQLPrepare` + `SQLBindParameter` (SQL_C_CHAR /
+SQL_VARCHAR) + `SQLExecute`. SQL Server applies its standard
+type coercion server-side. Arity mismatches surface as `"param
+count mismatch: got X, sql expects Y"` in `LastError`.
 
 ### Connection string
 
